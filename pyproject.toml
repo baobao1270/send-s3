@@ -1,6 +1,6 @@
 [project]
 name = "send-s3"
-version = "3.0.0-alpha.7"
+version = "3.0.0"
 description = "CLI tool for uploading files to S3-compatible storage services."
 authors = [{name = "Joseph Chris", email = "joseph@josephcz.xyz"}]
 readme = "README.md"
