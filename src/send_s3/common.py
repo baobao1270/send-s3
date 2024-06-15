@@ -1,6 +1,6 @@
 import os
 from io import TextIOWrapper
-from typing import Union, TextIO
+from typing import Union, TextIO, Mapping
 from importlib.metadata import metadata
 
 PROG = "send-s3"
@@ -10,6 +10,11 @@ DESCRIPTION = metadata(PROG)["summary"]
 LICENSE_NAME = metadata(PROG)["license"]
 LINESEP = os.linesep
 MACOS_HELPER_URL = "https://www.icloud.com/shortcuts/b84eab4b8df141d89a25f048047ea4ff"
+
+
+URLParams = Mapping[str, str]
+HTTPHeaders = Mapping[str, str]
+HTTPPayload = Union[bytes, str]
 
 
 def data_directory() -> str:
@@ -26,6 +31,15 @@ def app_directory(filename: str) -> str:
     return os.path.join(data_directory(), PROG, filename)
 
 
+def human_readable_size(size: int) -> str:
+    units = ['B', 'KB', 'MB', 'GB']
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    return f"{size:.2f} {units[unit_index]}"
+
+
 class Console:
     def __init__(self, text: str = '') -> None:
         self.text = text
@@ -40,5 +54,6 @@ class Console:
 
 __all__ = [
     "PROG", "AUTHOR", "VERSION", "DESCRIPTION", "LICENSE_NAME", "LINESEP", "MACOS_HELPER_URL",
-    "Console", "data_directory", "app_directory"
+    "URLParams", "HTTPHeaders", "HTTPPayload",
+    "Console", "data_directory", "app_directory", "human_readable_size"
 ]

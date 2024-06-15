@@ -3,63 +3,62 @@ import sys
 import json
 import datetime
 import argparse
+from typing import Union, Optional
 
-from send_s3.db import Database
+from send_s3.db import Database, LogEntrySelectOptions, LogEntry
 from send_s3.common import LINESEP, Console
 
 DATE_REGEX = r'^\d{4}-\d{2}-\d{2}$'
 TIME_REGEX = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$'
 
 
-def human_readable_size(size: int) -> str:
-    if size < 1024:
-        return f"{size} B"
-    size /= 1024
-    if size < 1024:
-        return f"{size:.2f} KB"
-    size /= 1024
-    if size < 1024:
-        return f"{size:.2f} MB"
-    size /= 1024
-    return f"{size:.2f} GB"
+def parse_time(time_expr: Optional[str]) -> Union[None, False, datetime.datetime]:
+    if time_expr is None:
+        return None
+    if re.match(DATE_REGEX, time_expr):
+        time_expr += 'T00:00:00'
+    if not re.match(TIME_REGEX, time_expr):
+        Console() >> f"ERROR: Invalid time format: {time_expr}" >> LINESEP >> sys.stderr
+        raise False
+    try:
+        return datetime.datetime.strptime(time_expr, '%Y-%m-%dT%H:%M:%S')
+    except ValueError:
+        Console() >> f"ERROR: Invalid time format: {time_expr}" >> LINESEP >> sys.stderr
+        raise False
+
+
+def print_log(log: LogEntry) -> None:
+    Console() >> "\033[1;32m" >> log.checksum >> "\033[0m" >> LINESEP >> sys.stdout
+    Console() >> "\033[1;33m" >> f"Date: \033[0m{log.display_time()}" >> LINESEP >> sys.stdout
+    Console() >> "\033[1;33m" >> f"File: \033[0m{log.filepath}" >> LINESEP >> sys.stdout
+    Console() >> "\033[1;33m" >> f"Key:  \033[0m{log.key}" >> LINESEP >> sys.stdout
+    Console() >> "\033[1;33m" >> f"Size: \033[0m{log.display_size()}" >> LINESEP >> sys.stdout
+    Console() >> "\033[1;33m" >> f"URL:  \033[0m{log.url}" >> LINESEP >> sys.stdout
+    Console() >> LINESEP >> sys.stdout
+    print_download_links(log)
+    Console() >> LINESEP >> ("-" * 60) >> LINESEP >> sys.stdout
+
+
+def print_download_links(log: LogEntry) -> None:
+    download_links = log.data_dict().get('download_links', {})
+    max_len = max(map(len, download_links.keys()))
+    Console() >> '  Alternative Download Links:' >> LINESEP >> sys.stdout
+    for domain, url in download_links.items():
+        Console() >> '    ' >> f"{domain:<{max_len}}: {url}" >> LINESEP >> sys.stdout
 
 
 def main(args: argparse.Namespace) -> int:
     db = Database()
-    time_from, time_to = None, None
-    if args.time_from:
-        if re.match(DATE_REGEX, args.time_from):
-            args.time_from += 'T00:00:00'
-        if not re.match(TIME_REGEX, args.time_from):
-            Console() >> f"ERROR: Invalid time format in '--from': {args.time_from}" >> sys.stderr
-            return 1
-        time_from = datetime.datetime.strptime(args.time_from, '%Y-%m-%dT%H:%M:%S')
-    if args.time_to:
-        if re.match(DATE_REGEX, args.time_to):
-            args.time_to += 'T23:59:59'
-        if not re.match(TIME_REGEX, args.time_to):
-            Console() >> f"ERROR: Invalid time format in '--to': {args.time_to}" >> sys.stderr
-            return 1
-        time_to = datetime.datetime.strptime(args.time_to, '%Y-%m-%dT%H:%M:%S')
-    logs = db.select(args.limit, time_from, time_to, args.name)
-    logs = list(logs)
+    time_from, time_to = parse_time(args.time_from), parse_time(args.time_to)
+    if time_from is False or time_to is False:
+        return 1
+    logs = db.select(LogEntrySelectOptions(limit=args.limit or 100, name=args.name,
+                                           time_from=time_from, time_to=time_to))
     if args.json:
         Console() >> json.dumps(logs, indent=2, ensure_ascii=False) >> sys.stdout
         return 0
     for log in logs:
-        date = datetime.datetime.fromtimestamp(log['timestamp']).strftime('%Y-%m-%d %H:%M:%S %Z')
-        Console() >> "\033[1;32m" >> log['checksum'] >> "\033[0m" >> LINESEP >> sys.stdout
-        Console() >> "\033[1;33m" >> f"Date: \033[0m{date}" >> LINESEP >> sys.stdout
-        Console() >> "\033[1;33m" >> f"File: \033[0m{log['filepath']}" >> LINESEP >> sys.stdout
-        Console() >> "\033[1;33m" >> f"Key:  \033[0m{log['key']}" >> LINESEP >> sys.stdout
-        Console() >> "\033[1;33m" >> f"Size: \033[0m{human_readable_size(log['size'])}" >> LINESEP >> sys.stdout
-        Console() >> "\033[1;33m" >> f"URL:  \033[0m{log['url']}" >> LINESEP >> sys.stdout
-        Console() >> LINESEP >> sys.stdout
-        download_links = log['data'].get('download_links', {})
-        max_len = max(map(len, download_links.keys()))
-        for domain, url in download_links.items():
-            Console() >> '    ' >> f"download_url/{domain:<{max_len}}: {url}" >> LINESEP >> sys.stdout
-        Console() >> LINESEP >> ("-" * 60) >> LINESEP >> sys.stdout
+        print_log(log)
     return 0
 
 

@@ -47,7 +47,7 @@ class Config(BaseConfig):
             return next(iter(self.domains.values())).format(**self.model_dump())
         raise IndexError(f"Domain '{self.transport.upload_domain}' not found in configuration")
 
-    def preferred_download_domains(self) -> Dict[str, str]:
+    def preferred_download_domains(self) -> Mapping[str, str]:
         domains = {}
         for domain_type in self.transport.download_domain:
             if result := self.domains.get(domain_type):

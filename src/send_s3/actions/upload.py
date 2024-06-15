@@ -1,48 +1,41 @@
 import os
 import sys
+import time
+import json
 import hashlib
 import argparse
-import requests
 import traceback
 import urllib.parse
-from base64 import b64encode
-from typing import Mapping, Tuple, Sequence
-from xml.etree import ElementTree
-from concurrent.futures import ThreadPoolExecutor
+from typing import Mapping, Tuple, Optional
 
-from send_s3.db import Database
-from send_s3.s3 import S3Request, URLParams, HTTPHeaders, HTTPPayload
+from send_s3.db import Database, LogEntry
+from send_s3.s3 import S3MultipartUpload
 from send_s3.config import Config
-from send_s3.common import PROG, VERSION, LINESEP, Console
-
+from send_s3.common import PROG, VERSION, LINESEP, Console, HTTPHeaders, human_readable_size
 
 MultiPartSlice = Tuple[int, int, int]
 MultiPartResult = Tuple[int, str]
 
 
 class File:
-    def __init__(self, args: argparse.Namespace, config: Config, filepath: str):
+    def __init__(self, args: argparse.Namespace, config: Config, filepath: str,
+                 checksum_chunk_size: int = 1024 * 1024 * 16):
         if not self.check(filepath):
             raise Exception(f"Can not upload file: '{filepath}'")
         self.args = args
         self.config = config
-        self.upload_domain = config.preferred_upload_domain()
-        self.download_domain = config.preferred_download_domain()
-        self.download_domains = config.preferred_download_domains()
         self.filepath = filepath
         self.key = config.format_filename(filepath)
         self.url_encoded_key = urllib.parse.quote(self.key)
-        self.size = os.path.getsize(filepath)
-        self.completed = 0
-        self.checksum_chunk_size = 1024 * 1024 * 2    # 2 MB
-        self.multipart_chunk_size = 1024 * 1024 * 5   # 5 MB
-        self.multipart_threads = 8
-        self.headers: HTTPHeaders = {
-            'User-Agent': f'{PROG}/{VERSION}',
-        }
+        self.checksum_chunk_size = checksum_chunk_size
+        self.hide_progress = self.args.typora
+        self.show_single_download_link = self.args.typora
+        # self.headers: HTTPHeaders = {
+        #     'User-Agent': f'{PROG}/{VERSION}',
+        # }
 
     def __call__(self, *args, **kwargs):
-        self.upload()
+        self.upload_file()
 
     @staticmethod
     def check(filepath: str) -> bool:
@@ -53,12 +46,6 @@ class File:
             Console() >> f"ERROR: Is a directory: {filepath}" >> LINESEP >> sys.stderr
             return False
         return True
-
-    def hide_progress(self) -> bool:
-        return self.args.typora
-
-    def single_download_link(self) -> bool:
-        return self.args.typora
 
     def hash(self) -> HTTPHeaders:
         available_checksums = list(filter(lambda x: hasattr(hashlib, x), self.config.checksum))
@@ -72,97 +59,67 @@ class File:
                     hash_func.update(chunk)
         return {k: v.hexdigest() for k, v in hash_list.items()}
 
-    def split_parts(self) -> Sequence[MultiPartSlice]:
-        for i, start in enumerate(range(0, self.size, self.multipart_chunk_size)):
-            yield i + 1, start, min(start + self.multipart_chunk_size - 1, self.size)
-
-    def progress(self) -> None:
-        if self.hide_progress():
+    def progress_callback(self, completed: int, total: int) -> None:
+        if self.hide_progress:
             return
-        percent = min((self.completed / self.size) * 100, 100.0)
-        Console() >> f"{percent:.2f}% ({min(self.completed, self.size)}/{self.size}) [{self.key}]\r" >> sys.stderr
+        display_completed = human_readable_size(min(completed, total))
+        display_total = human_readable_size(total)
+        percentage = (completed / total) * 100
+        Console() >> f"{percentage:.2f}% ({display_completed} / {display_total}) [{self.key}]\r" >> sys.stderr
 
-    def initialize_multi_part(self, hashes: Mapping[str, str]) -> str:
-        signed_request = S3Request.from_config('POST', self.url_encoded_key, self.config,
-                                               self.headers, dict(self.config.format_metadata(hashes)),
-                                               params={'uploads': ''})
-        response = requests.request(**signed_request.to_request())
-        response.raise_for_status()
-        result = ElementTree.fromstring(response.text)
-        return result.find('{*}UploadId').text
-
-    def upload_parts(self, upload_id: str) -> Sequence[MultiPartResult]:
-        def upload_part(part_number: int, start: int, end: int):
-            self.progress()
-            with open(self.filepath, 'rb') as f:
-                f.seek(start)
-                data = f.read(end - start + 1)
-                headers = {
-                    'Content-MD5': b64encode(hashlib.md5(data).digest()).decode(),
-                    'X-Amz-Content-Sha256': hashlib.sha256(data).hexdigest(),
-                }
-                signed_request = S3Request.from_config('PUT', self.url_encoded_key, self.config,
-                                                       self.headers, headers,
-                                                       params={'partNumber': part_number, 'uploadId': upload_id},
-                                                       data=data)
-                response = requests.request(**signed_request.to_request())
-                response.raise_for_status()
-                self.completed += len(data)
-                self.progress()
-                return part_number, response.headers['ETag']
-        with ThreadPoolExecutor(max_workers=self.multipart_threads) as executor:
-            results = []
-            for i, s, e in self.split_parts():
-                thread = executor.submit(upload_part, i, s, e)
-                results.append(thread)
-        results = [r.result() for r in results]
-        if not self.hide_progress():
+    def progress_complete(self) -> None:
+        if not self.hide_progress:
             Console() >> LINESEP >> sys.stderr
-        return results
 
-    def complete_multi_part(self, upload_id: str, parts: Sequence[MultiPartResult]) -> HTTPHeaders:
-        parts = ''.join([f'<Part><PartNumber>{p}</PartNumber><ETag>{e}</ETag></Part>' for p, e in parts])
-        data = f'<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>'.encode('utf-8')
-        signed_request = S3Request.from_config('POST', self.url_encoded_key, self.config,
-                                               self.headers,
-                                               params={'uploadId': upload_id},
-                                               data=data)
-        response = requests.request(**signed_request.to_request())
-        response.raise_for_status()
-        return dict(response.headers)
+    def download_link(self, domain: Optional[str] = None) -> str:
+        if not domain:
+            domain = self.config.preferred_download_domain()
+        return f"https://{domain}/{self.url_encoded_key}"
 
-    def download_links(self) -> Tuple[str, Mapping[str, str]]:
-        return f"https://{self.download_domain}/{self.url_encoded_key}", {
-            k: f"https://{v}/{self.url_encoded_key}" for k, v in self.download_domains.items()
+    def download_links(self) -> Mapping[str, str]:
+        return {
+            domain_type: self.download_link(domain)
+            for domain_type, domain in self.config.preferred_download_domains().items()
         }
 
-    def write_log(self, hashes: HTTPHeaders, upload_id: str, parts: Sequence[MultiPartResult], headers: HTTPHeaders):
-        single, multiple = self.download_links()
+    def write_upload_log(self, hashes: HTTPHeaders, upload_result: S3MultipartUpload) -> None:
         db = Database()
-        db.insert(self.filepath, self.key, self.size, f"sha256:{hashes['sha256']}", single, {
-            'upload_id': upload_id,
-            'parts': parts,
-            'headers': headers,
-            'download_links': multiple
-        })
+        db.insert(LogEntry(
+            timestamp=int(time.time()),
+            filepath=self.filepath,
+            key=self.key,
+            size=os.path.getsize(self.filepath),
+            checksum=f"sha256:{hashes['sha256']}",
+            url=self.download_link(),
+            data=json.dumps({
+                'parts': upload_result.parts,
+                'upload_id': upload_result.upload_id,
+                'headers': upload_result.finalize_headers,
+                'download_links': self.download_links()})))
 
-    def print_download_links(self) -> None:
-        single, multiple = self.download_links()
-        if self.single_download_link():
-            Console() >> single >> LINESEP >> sys.stdout
+    def show_download_links(self) -> None:
+        if self.show_single_download_link:
+            Console() >> self.download_link() >> LINESEP >> sys.stdout
             return
-        length = max(max(map(len, multiple.keys())), len('file')) + 2
+        links = self.download_links()
+        length = max(max(map(len, links.keys())), len('file')) + 2
         Console() >> f"{'local':<{length}}: {self.filepath}" >> LINESEP >> sys.stdout
-        for domain_type, url in multiple.items():
+        for domain_type, url in links.items():
             Console() >> f"{domain_type:<{length}}: {url}" >> LINESEP >> sys.stdout
 
-    def upload(self):
+    def upload_file(self):
         hashes = self.hash()
-        upload_id = self.initialize_multi_part(hashes)
-        parts = self.upload_parts(upload_id)
-        headers = self.complete_multi_part(upload_id, parts)
-        self.write_log(hashes, upload_id, parts, headers)
-        self.print_download_links()
+        result = S3MultipartUpload(
+            self.config,
+            filepath=self.filepath,
+            key=self.url_encoded_key,
+            headers={'User-Agent': f'{PROG}/{VERSION}'},
+            hashes=hashes,
+            progress_callback=lambda x, y: self.progress_callback(x, y),
+        )()
+        self.progress_complete()
+        self.write_upload_log(hashes, result)
+        self.show_download_links()
 
 
 def main(args: argparse.Namespace) -> int:
